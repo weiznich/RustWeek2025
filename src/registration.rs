@@ -1,6 +1,9 @@
 //! Routes for handling the registration of a new participant
 use crate::app_state::{self, AppState};
-use crate::database::schema::{categories, competitions, participants, races, starts};
+use crate::database::schema::{
+    categories, competitions, participants, participants_in_special_category, races,
+    special_categories, starts,
+};
 use crate::database::shared_models::{Competition, Race, SpecialCategories};
 use crate::database::Id;
 use crate::errors::{Error, Result};
@@ -8,9 +11,8 @@ use axum::extract::Path;
 use axum::response::{Html, Redirect};
 use axum::Router;
 use diesel::associations::HasTable;
-use diesel::dsl;
-use diesel::prelude::*;
 use diesel::sql_types::Integer;
+use diesel::{dsl, prelude::*};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
@@ -205,22 +207,71 @@ impl RegistrationForm {
         self.is_valid()?;
         let age = time::OffsetDateTime::now_utc().year() - self.new_participant.age;
         let special_categories_id = self.special_categories.keys().copied().collect::<Vec<_>>();
+        state
+            .with_connection(move |conn| {
+                let category_id = starts::table
+                    .inner_join(races::table)
+                    .inner_join(categories::table)
+                    .filter(races::competition_id.eq(competition_id))
+                    .filter(races::id.eq(self.race))
+                    .filter(
+                        age.into_sql::<Integer>()
+                            .between(categories::from_age, categories::to_age),
+                    )
+                    .filter(categories::male.eq(self.male))
+                    .select(categories::id)
+                    .first::<Id>(conn)?;
 
-        // for inserting/updating participant data we need to perform several database related operations
-        //
-        // (Consider focusing on inserting first and adding update support later)
-        //
-        // 1. Get a connection via the `with_connection` state accessor
-        // 2. Get all relevant data:
-        //    + Resolve Race id + birth year to relevat category
-        //       + Requires joining the revelant table, filtering by the provided data
-        //    + Resolve special categories by id (verify that they exist)
-        //        + Requires filtering by the relevant data
-        //        + You can skip that in the first iteration
-        // 3. Insert participant
-        // 4. Insert special category mapping
+                let special_categories = special_categories::table
+                    .filter(special_categories::id.eq_any(special_categories_id))
+                    .filter(special_categories::race_id.eq(self.race))
+                    .select(special_categories::id)
+                    .load::<Id>(conn)?;
 
-        todo!("Insert the new participant into the database")
+                let participant_id = if let Some(participant_id) = participant_id {
+                    let count = diesel::update(participants::table.find(participant_id))
+                        .set((
+                            participants::category_id.eq(category_id),
+                            &self.new_participant,
+                        ))
+                        .execute(conn)?;
+                    if count != 1 {
+                        return Err(diesel::result::Error::NotFound);
+                    }
+                    diesel::delete(participants_in_special_category::table.filter(
+                        participants_in_special_category::participant_id.eq(participant_id),
+                    ))
+                    .execute(conn)?;
+                    participant_id
+                } else {
+                    diesel::insert_into(participants::table)
+                        .values((
+                            participants::category_id.eq(category_id),
+                            &self.new_participant,
+                        ))
+                        .returning(participants::id)
+                        .get_result::<Id>(conn)?
+                };
+
+                let insert_special = special_categories
+                    .into_iter()
+                    .map(|special_id| {
+                        (
+                            participants_in_special_category::special_category_id.eq(special_id),
+                            participants_in_special_category::participant_id.eq(participant_id),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                if !insert_special.is_empty() {
+                    diesel::insert_into(participants_in_special_category::table)
+                        .values(insert_special)
+                        .execute(conn)?;
+                }
+
+                Ok(())
+            })
+            .await
     }
 }
 
@@ -295,8 +346,10 @@ pub async fn render_registration_page_with_optional_data(
     title: &str,
     target_uri: String,
 ) -> Result<Html<String>> {
-    let (competition, races): (Competition, Vec<RaceWithSpecialCategory>) =
-        todo!("Load required data to render registration page");
+    let (competition, races) = state
+        .with_connection(move |conn| load_competition_data(conn, event_id))
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("Computation: {}", event_id)))?;
 
     let min_age = races.iter().map(|r| r.race.min_age).max();
     let max_age = races.iter().map(|r| r.race.max_age).min();
